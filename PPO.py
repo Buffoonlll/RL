@@ -31,7 +31,7 @@ class ValueNet(torch.nn.Module):
 class PPO:
     def __init__(self, env, ppo_type, hidden_dim=128, actor_lr=1e-3, critic_lr=1e-2, gamma=0.98, epochs=10, lmbda=0.95,
                  beta=3.0, eps=0.2, kl_constraint=0.0005, num_episodes=500):
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         self.env = env
         self.ppo_type = ppo_type
         state_dim = env.observation_space.shape[0]
@@ -47,14 +47,13 @@ class PPO:
         self.kl_constraint = kl_constraint
         self.num_episodes = num_episodes
         self.return_list = []
-        self.device = device
         self.critic = ValueNet(state_dim, hidden_dim).to(self.device)
         self.actor = PolicyNet(state_dim, hidden_dim, action_dim).to(self.device)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
 
     def take_action(self, state):
-        state = torch.FloatTensor(state).to(self.device)
+        state = torch.tensor(np.array([state])).to(self.device)
         probs = self.actor(state)
         dist = torch.distributions.Categorical(probs)
         action = dist.sample()
@@ -127,7 +126,7 @@ class PPO:
                     done = False
                     while not done:
                         action = self.take_action(state)
-                        next_state, reward, done, truncated = self.env.step(action)
+                        next_state, reward, done, truncated, _ = self.env.step(action)
                         done = done or truncated
                         transition_dict['states'].append(state)
                         transition_dict['actions'].append(action)
@@ -156,7 +155,7 @@ def moving_average(a, window_size):
 
 
 if __name__ == '__main__':
-    env_name = 'CartPole-v0'
+    env_name = 'CartPole-v1'
     env = gym.make(env_name)
     env.reset(seed=0)
     torch.manual_seed(0)
