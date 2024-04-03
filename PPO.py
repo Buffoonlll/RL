@@ -29,55 +29,52 @@ class ValueNet(torch.nn.Module):
 
 
 class PPO:
-    def __init__(self, env, ppo_type, hidden_dim=128, actor_lr=1e-3, critic_lr=1e-2, gamma=0.98, epochs=10, lmbda=0.95,
-                 beta=3.0, eps=0.2, kl_constraint=0.0005, num_episodes=500):
+    def __init__(self, env, ppo_type, hidden_dim=128, actor_lr=1e-3, critic_lr=1e-2,
+                 la=0.95, gamma=0.98, beta=3.0, kl_constraint=0.0005, epochs=10, num_episodes=500, eps=0.2):
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         self.env = env
         self.ppo_type = ppo_type
         state_dim = env.observation_space.shape[0]
-        self.hidden_dim = hidden_dim
         action_dim = env.action_space.n
-        self.actor_lr = actor_lr
-        self.critic_lr = critic_lr
-        self.gamma = gamma
-        self.epochs = epochs
-        self.lmbda = lmbda
-        self.beta = beta
-        self.eps = eps
-        self.kl_constraint = kl_constraint
-        self.num_episodes = num_episodes
-        self.return_list = []
-        self.critic = ValueNet(state_dim, hidden_dim).to(self.device)
         self.actor = PolicyNet(state_dim, hidden_dim, action_dim).to(self.device)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.critic = ValueNet(state_dim, hidden_dim).to(self.device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.gamma = gamma
+        self.la = la  # 用于计算优势函数
+        self.beta = beta
+        self.kl_constraint = kl_constraint
+        self.epochs = epochs  # 一条序列的数据用于训练的轮数
+        self.num_episodes = num_episodes
+        self.eps = eps
+        self.return_list = []
 
     def take_action(self, state):
-        state = torch.tensor(np.array([state])).to(self.device)
+        state = torch.tensor(np.array([state]), dtype=torch.float).to(self.device)
         probs = self.actor(state)
-        dist = torch.distributions.Categorical(probs)
-        action = dist.sample()
+        action_dist = torch.distributions.Categorical(probs)
+        action = action_dist.sample()
         return action.item()
 
-    def advantage(self, td_delta):
-        td_delta = td_delta.detach().cpu().numpy()
+    def compute_advantage(self, td_delta):
+        td_delta = td_delta.detach().numpy()
         advantage_list = []
-        advantage = 0
+        advantage = 0.0
         for delta in td_delta[::-1]:
-            advantage = delta + self.gamma * self.lmbda * advantage
+            advantage = self.gamma * self.la * advantage + delta
             advantage_list.append(advantage)
         advantage_list.reverse()
-        return torch.FloatTensor(advantage_list).to(self.device)
+        return torch.tensor(np.array(advantage_list), dtype=torch.float)
 
     def update(self, transition_dict):
-        states = torch.FloatTensor(transition_dict['states']).to(self.device)
+        states = torch.tensor(np.array(transition_dict['states']), dtype=torch.float).to(self.device)
         actions = torch.tensor(transition_dict['actions']).view(-1, 1).to(self.device)
-        rewards = torch.FloatTensor(transition_dict['rewards']).view(-1, 1).to(self.device)
-        next_states = torch.FloatTensor(transition_dict['next_states']).to(self.device)
-        dones = torch.FloatTensor(transition_dict['dones']).view(-1, 1).to(self.device)
+        rewards = torch.tensor(transition_dict['rewards'], dtype=torch.float).view(-1, 1).to(self.device)
+        next_states = torch.tensor(np.array(transition_dict['next_states']), dtype=torch.float).to(self.device)
+        dones = torch.tensor(transition_dict['dones'], dtype=torch.float).view(-1, 1).to(self.device)
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
         td_delta = td_target - self.critic(states)
-        advantage = self.advantage(td_delta.cpu()).to(self.device)
+        advantage = self.compute_advantage(td_delta.cpu()).to(self.device)
         old_log_probs = torch.log(self.actor(states).gather(1, actions)).detach()
         old_action_dists = torch.distributions.Categorical(self.actor(states))
 
@@ -93,7 +90,7 @@ class PPO:
                     self.beta = self.beta / 2
                 else:
                     pass
-                actor_loss = -torch.mean(ratio * advantage - self.beta * kl_div)
+                actor_loss = torch.mean(-(ratio * advantage - self.beta * kl_div))  # ppo-惩罚
                 critic_loss = torch.mean(F.mse_loss(self.critic(states), td_target.detach()))
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
@@ -105,9 +102,9 @@ class PPO:
             for _ in range(self.epochs):
                 log_probs = torch.log(self.actor(states).gather(1, actions))
                 ratio = torch.exp(log_probs - old_log_probs)
-                surr1 = ratio * advantage
-                surr2 = torch.clip(ratio, 1 - self.eps, 1 + self.eps) * advantage
-                actor_loss = -torch.mean(torch.min(surr1, surr2))
+                surrogate1 = ratio * advantage
+                surrogate2 = torch.clip(ratio, 1 - self.eps, 1 + self.eps) * advantage  # ppo-截断
+                actor_loss = torch.mean(-torch.min(surrogate1, surrogate2))
                 critic_loss = torch.mean(F.mse_loss(self.critic(states), td_target.detach()))
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
@@ -135,14 +132,14 @@ class PPO:
                         transition_dict['dones'].append(done)
                         state = next_state
                         episode_return += reward
-                        self.return_list.append(episode_return)
-                        self.update(transition_dict)
-                        if (i_episode + 1) % 10 == 0:
-                            pbar.set_postfix({
-                                'episode': '%d' % (self.num_episodes / 10 * i + i_episode + 1),
-                                'return': '%.3f' % np.mean(self.return_list[-10:])
-                            })
-                        pbar.update(1)
+                    self.return_list.append(episode_return)
+                    self.update(transition_dict)
+                    if (i_episode + 1) % 10 == 0:
+                        pbar.set_postfix({
+                            'episode': '%d' % (self.num_episodes / 10 * i + i_episode + 1),
+                            'return': '%.3f' % np.mean(self.return_list[-10:])
+                        })
+                    pbar.update(1)
 
 
 def moving_average(a, window_size):
@@ -150,7 +147,7 @@ def moving_average(a, window_size):
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
     r = np.arange(1, window_size - 1, 2)
     begin = np.cumsum(a[:window_size - 1])[::2] / r
-    end = (np.cumsum(a[:-window_size])[1::2] / r)[::-1]
+    end = (np.cumsum(a[:-window_size:-1])[::2] / r)[::-1]
     return np.concatenate((begin, middle, end))
 
 
